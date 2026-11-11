@@ -1,0 +1,6 @@
+.DS_Store
+
+# Report output
+PrivEscAudit_*.json
+PrivEscAudit_*.csv
+PrivEscAudit_*.html

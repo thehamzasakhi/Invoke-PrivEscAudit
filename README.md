@@ -14,9 +14,9 @@ A read-only Windows **privilege-escalation** and **credential-exposure** enumera
 | Severity model | None | Info → Critical, per finding |
 | Reporting | Copy/paste console | JSON / CSV / **HTML report** |
 | Remediation notes | No | Yes, per finding |
-| Speed control | All-or-nothing | `Quick / Standard / Deep` tiers |
-| Secret scan | Always-on, whole-drive | Opt-in, scoped, **masked output** |
-| `Win32_Product` risk | Uses it (can trigger MSI repairs) | Avoided |
+| Speed control | Default / `-FullCheck` | `Quick / Standard / Deep` tiers |
+| Secret scan | Username/password search of drives & registry on by default | Opt-in, scoped, **masked output** |
+| Localized Windows | — | Checks keyed on SIDs / privilege names, not English UI text |
 
 ---
 
@@ -83,7 +83,7 @@ This runs with default parameters only (Quick depth, Console + HTML).
 # Full local audit with secret scan, medium+ only, all export formats
 .\Invoke-PrivEscAudit.ps1 -Depth Standard -SecretScan -MinSeverity Medium -Format Console,Json,Csv,Html
 
-# Deep run (includes slow drive/registry sweeps + all-drive secret scan)
+# Deep run: secret scan widened to every fixed drive (slow)
 .\Invoke-PrivEscAudit.ps1 -Depth Deep -SecretScan
 
 # Secret scan targeting specific server roots
@@ -94,7 +94,7 @@ This runs with default parameters only (Quick depth, Console + HTML).
 
 | Parameter | Values | Default | Description |
 |---|---|---|---|
-| `-Depth` | `Quick` / `Standard` / `Deep` | `Quick` | Controls scan breadth. Quick skips slow sweeps. |
+| `-Depth` | `Quick` / `Standard` / `Deep` | `Quick` | `Standard` adds PuTTY, PowerShell history and cached GPP checks. `Deep` = Standard, plus all fixed drives as default `-SecretScan` roots (no effect without `-SecretScan`). |
 | `-Format` | `Console` `Json` `Csv` `Html` | `Console,Html` | One or more output formats. |
 | `-MinSeverity` | `Info` … `Critical` | `Info` | Lowest severity to display/export. |
 | `-OutputPath` | path | current dir | Destination for report files. |
@@ -111,39 +111,50 @@ Report files are written as `PrivEscAudit_<HOST>_<timestamp>.{json,csv,html}`.
 ### Privilege escalation
 
 - **System context** — OS, build, architecture, domain membership, and hotfix recency (stale-patch signal)
-- **Token privileges** — flags exploitable rights (`SeImpersonate`, `SeBackup`/`SeRestore`, `SeDebug`, `SeLoadDriver`, `SeTakeOwnership`, `SeCreateToken`, `SeTcb`, `SeManageVolume`, `SeEnableDelegation`) with the abuse path; High when enabled
-- **Users & groups** — membership of Administrators, Backup Operators, RDP, Remote Management, Hyper-V Admins, DnsAdmins
+- **Token privileges** — flags exploitable rights (`SeImpersonate`, `SeAssignPrimaryToken`, `SeBackup`/`SeRestore`, `SeDebug`, `SeLoadDriver`, `SeTakeOwnership`, `SeCreateToken`, `SeTcb`, `SeManageVolume`, `SeEnableDelegation`) with the abuse path; High when held (a disabled privilege in the token can be enabled by its holder)
+- **Users & groups** — elevation + integrity level; membership of Administrators, Backup Operators, RDP, Remote Management, Hyper-V Admins (resolved by SID), DnsAdmins
 - **AlwaysInstallElevated** — Critical when both HKLM + HKCU are set
-- **Services** — unquoted service paths, writable service binaries, writable service registry keys (ImagePath / ServiceDll rewrite)
-- **Scheduled tasks** — writable task binaries, severity weighted by run-as principal
+- **Services** — unquoted service paths, writable service binaries, writable service registry keys (ImagePath / ServiceDll / Performance subkey)
+- **Scheduled tasks** — writable task binaries *and* script/binary paths in task arguments; High when the task runs as SYSTEM / a service account, as Administrators, or with highest privileges
 - **Autoruns** — writable Run / RunOnce targets (HKLM vs HKCU weighted)
-- **PATH** — writable directories enabling binary planting / DLL search-order hijack
+- **PATH** — writable directories on the **machine** PATH enabling binary planting / DLL search-order hijack
 - **UAC** — `EnableLUA`, consent prompt behavior, `LocalAccountTokenFilterPolicy`
 - **Defender / AV** — real-time state, tamper protection, signature age, path exclusions
 
+### How writability is decided
+
+Service, task, autorun and PATH checks evaluate the file/registry ACL against the current token's SIDs: only ACEs that apply to the object itself (inherit-only ACEs skipped), generic rights mapped to specific ones, Deny ACEs subtracted. A file counts as writable with WriteData / ChangePermissions / TakeOwnership; a missing file counts if its nearest existing folder allows creating files (or folders, when intermediate folders are missing).
+
+When the script runs **elevated**, Administrators and SYSTEM ACEs are ignored. Otherwise nearly every ACL on the box would show as "writable". For the true low-privilege picture, run it as the low-privilege user you are assessing.
+
 ### Credential exposure
 
+All depths:
+
 - Unattend / sysprep answer files (embedded admin passwords)
-- Readable SAM / SYSTEM hive backups
-- Winlogon autologon cleartext credentials
+- Readable, non-empty SAM / SYSTEM hive backups
+- Winlogon autologon: cleartext `DefaultPassword` (High) vs autologon without one (Low)
 - Credential Manager stored targets
-- Cloud credential files (AWS / Azure / GCP)
+- Cloud credential files (AWS / Azure / GCP) across user profiles
+
+`-Depth Standard` or `Deep` only:
+
 - PuTTY stored proxy passwords
-- PowerShell console history with secret-like lines
-- Group Policy Preferences `cpassword`
+- PowerShell console history with secret-like lines (current user)
+- Cached Group Policy Preferences `cpassword`
 
 ### Secret scan (`-SecretScan`)
 
-Content scan across scoped roots with ~30 regex patterns, each severity-tagged. Matched values are **masked** in output so the report doesn't become a secret store.
+Content scan across scoped roots with 24 regex patterns, each severity-tagged. Matched values are **masked** in output: the key name is kept, plus at most the first 2 characters of the value (4 for bare tokens such as `AKIA…`), followed by a fixed-length mask. The report doesn't become a secret store and doesn't reveal secret lengths.
 
 - Generic assignments: `password` / `pwd` / `secret` / `api_key` / token / username
-- Connection strings: SQL/ODBC/OLEDB password fields; `mongodb://` `postgres://` `redis://` `mysql://` URIs with inline credentials
+- Connection strings: SQL/ODBC/OLEDB password fields; `mongodb://` `postgres://` `redis://` `mysql://` `amqp://` URIs with inline credentials
 - Private keys: PEM `PRIVATE KEY` blocks, PuTTY `.ppk`
 - JWTs
 - Cloud/vendor keys: AWS access-key IDs & secret keys, Google, Slack, GitHub, GitLab, Stripe, Twilio, SendGrid, Azure storage keys/SAS
 - Windows leftovers: GPP `cpassword`, `net user /add`, `ConvertTo-SecureString -AsPlainText`
 
-Scoped by default to `inetpub`, `ProgramData`, IIS config, user profiles, and `Users\Public` (all fixed drives under `-Depth Deep`). Extension-filtered to config/code/text; skips WinSxS, servicing, `$Recycle.Bin`, `node_modules`, `.git`.
+Scoped by default to `inetpub`, `xampp`, `ProgramData`, IIS config, the **current user's** profile, and `Users\Public` (all fixed drives under `-Depth Deep`). Extension-filtered to config/code/text; skips WinSxS, servicing, `$Recycle.Bin`, `node_modules`, `.git`.
 
 ---
 

@@ -14,9 +14,10 @@
     Use only on systems you own or are explicitly authorized to assess.
 
 .PARAMETER Depth
-    Quick    - fast checks only (default). Skips full-drive and full-registry sweeps.
-    Standard - Quick plus targeted credential-file locations and common app configs.
-    Deep     - Standard plus (optional, slow) recursive drive/registry credential hunt.
+    Quick    - fast checks only (default).
+    Standard - Quick plus PuTTY sessions, PowerShell history and cached GPP cpassword.
+    Deep     - Standard; with -SecretScan, widens the default scan roots to every
+               fixed drive (slow). Without -SecretScan, Deep behaves like Standard.
 
 .PARAMETER OutputPath
     Folder for exported reports. Defaults to the current directory.
@@ -64,6 +65,13 @@ $script:Stopwatch   = [System.Diagnostics.Stopwatch]::StartNew()
 $script:SevRank     = @{ Info = 0; Low = 1; Medium = 2; High = 3; Critical = 4 }
 $script:CurrentUser = "$env:USERDOMAIN\$env:USERNAME"
 
+# User profiles root (not always C:\Users)
+$script:ProfilesDir = "$env:SystemDrive\Users"
+try {
+    $pd = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -Name ProfilesDirectory -ErrorAction Stop).ProfilesDirectory
+    if ($pd) { $script:ProfilesDir = [Environment]::ExpandEnvironmentVariables($pd) }
+} catch {}
+
 function Add-Finding {
     param(
         [Parameter(Mandatory)][string]$Category,
@@ -93,50 +101,105 @@ function Write-Section {
     Write-Verbose "[$([int]$script:Stopwatch.Elapsed.TotalSeconds)s] $Name"
 }
 
-# Return the current principal's effective identity references (user + group SIDs/names).
-function Get-IdentityReferences {
+# Well-known SIDs (used instead of names so checks work on non-English Windows)
+$script:SidAdministrators = 'S-1-5-32-544'
+$script:SidSystem         = 'S-1-5-18'
+
+function ConvertTo-AccountName {
+    param([string]$Sid)
+    try { ([System.Security.Principal.SecurityIdentifier]$Sid).Translate([System.Security.Principal.NTAccount]).Value }
+    catch { $Sid }
+}
+
+$script:IsElevated = $false
+try {
+    $wp = [System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent())
+    $script:IsElevated = $wp.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch {}
+
+# SIDs of the current principal (user + enabled token groups + well-known broad groups).
+# When elevated, Administrators and SYSTEM are excluded: they can write almost
+# everything, so counting them would flag every service/PATH/registry ACL.
+function Get-IdentitySids {
     $ids = [System.Collections.Generic.List[string]]::new()
-    $ids.Add($script:CurrentUser)
     try {
         $wi = [System.Security.Principal.WindowsIdentity]::GetCurrent()
         $ids.Add($wi.User.Value)
-        foreach ($g in $wi.Groups) {
-            $ids.Add($g.Value)
-            try { $ids.Add($g.Translate([System.Security.Principal.NTAccount]).Value) } catch {}
-        }
+        foreach ($g in $wi.Groups) { $ids.Add($g.Value) }   # excludes deny-only groups
     } catch {}
-    # Well-known groups that routinely matter for writability
-    'Everyone','BUILTIN\Users','NT AUTHORITY\Authenticated Users' | ForEach-Object { $ids.Add($_) }
-    return ($ids | Sort-Object -Unique)
+    # Everyone, Authenticated Users, BUILTIN\Users
+    'S-1-1-0','S-1-5-11','S-1-5-32-545' | ForEach-Object { $ids.Add($_) }
+    $exclude = @($script:SidSystem)
+    if ($script:IsElevated) { $exclude += $script:SidAdministrators }
+    return @($ids | Where-Object { $exclude -notcontains $_ } | Sort-Object -Unique)
 }
-$script:Identities = Get-IdentityReferences
+$script:Identities = Get-IdentitySids
 
-# Does the current principal hold a write-class right on a filesystem path?
-# Walks up the tree until an ACL is found. Returns the matched right or $null.
+# Effective rights the current principal holds on an ACL, considering only ACEs that
+# apply to the object itself (InheritOnly skipped), with generic rights mapped to
+# specific ones and Deny ACEs subtracted.
+# Returns Mask (effective) and Grants (allow ACEs: Name + Mask) for evidence.
+function Get-MyRights {
+    param([Parameter(Mandatory)]$Acl, [ValidateSet('File','Registry')][string]$Kind)
+    if ($Kind -eq 'File') { $prop = 'FileSystemRights'; $gAll = 0x1F01FF; $gWrite = 0x120116 }
+    else                  { $prop = 'RegistryRights';   $gAll = 0xF003F;  $gWrite = 0x20006 }
+    $allow = 0; $deny = 0
+    $grants = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ($r.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        $sid = $r.IdentityReference.Value
+        if ($script:Identities -notcontains $sid) { continue }
+        $m = [int]$r.$prop
+        if ($m -band 0x10000000) { $m = $m -bor $gAll }     # GENERIC_ALL
+        if ($m -band 0x40000000) { $m = $m -bor $gWrite }   # GENERIC_WRITE
+        if ($r.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny) {
+            $deny = $deny -bor $m
+        } else {
+            $allow = $allow -bor $m
+            $grants.Add([pscustomobject]@{ Name = (ConvertTo-AccountName $sid); Mask = $m })
+        }
+    }
+    [pscustomobject]@{ Mask = ($allow -band (-bnot $deny)); Deny = $deny; Grants = $grants }
+}
+
+# Rights that make a path/key attacker-controllable
+$script:FileWriteData   = 0x2       # WriteData on a file / CreateFiles on a directory
+$script:FileAddSubdir   = 0x4       # CreateDirectories (on a directory)
+$script:WriteDacOwner   = 0x40000 -bor 0x80000   # ChangePermissions | TakeOwnership
+$script:RegWriteMask    = 0x2 -bor 0x4 -bor 0x40000 -bor 0x80000  # SetValue | CreateSubKey | DAC | Owner
+
+# Can the current principal replace/create the file or directory at $Path?
+# Existing path: needs WriteData (file) or CreateFiles (dir), or WRITE_DAC/WRITE_OWNER.
+# Missing path: walks up to the nearest existing ancestor; creating a missing file
+# needs CreateFiles there, creating missing intermediate folders needs CreateDirectories.
+# Returns Path/Identity/Rights, or $null.
 function Test-WritableByMe {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
-    $target = $Path.Trim('"')
+    $target = $Path.Trim().Trim('"')
+    try { if (-not [System.IO.Path]::IsPathRooted($target)) { return $null } } catch { return $null }
+    $missingLevels = 0
     for ($i = 0; $i -lt 12 -and $target; $i++) {
-        try {
-            if (Test-Path -LiteralPath $target) {
-                $acl = Get-Acl -LiteralPath $target -ErrorAction Stop
-                foreach ($ace in $acl.Access) {
-                    if ($ace.AccessControlType -ne 'Allow') { continue }
-                    if ($script:Identities -notcontains $ace.IdentityReference.Value) { continue }
-                    $rights = $ace.FileSystemRights.ToString()
-                    if ($rights -match 'FullControl|Modify|Write|TakeOwnership|ChangePermissions|CreateFiles|AppendData') {
-                        return [pscustomobject]@{
-                            Path = $target; Identity = $ace.IdentityReference.Value; Rights = $rights
-                        }
-                    }
+        if (Test-Path -LiteralPath $target -ErrorAction SilentlyContinue) {
+            try { $acl = Get-Acl -LiteralPath $target -ErrorAction Stop } catch { return $null }
+            $need = if ($missingLevels -ge 2) { $script:FileAddSubdir } else { $script:FileWriteData }
+            $need = $need -bor $script:WriteDacOwner
+            $r = Get-MyRights -Acl $acl -Kind File
+            if ($r.Mask -band $need) {
+                $who = @($r.Grants | Where-Object { $_.Mask -band $need -band (-bnot $r.Deny) } |
+                         ForEach-Object Name | Sort-Object -Unique)
+                return [pscustomobject]@{
+                    Path     = $target
+                    Identity = ($who -join ', ')
+                    Rights   = ([System.Security.AccessControl.FileSystemRights]$r.Mask).ToString()
                 }
-                return $null  # ACL found, no write right -> stop
             }
-        } catch {}
-        $parent = Split-Path $target -Parent
-        if ($parent -eq $target -or [string]::IsNullOrEmpty($parent)) { break }
+            return $null  # nearest existing object is not writable -> stop
+        }
+        $parent = try { [System.IO.Path]::GetDirectoryName($target) } catch { $null }
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $target) { break }
         $target = $parent
+        $missingLevels++
     }
     return $null
 }
@@ -211,13 +274,16 @@ function Invoke-TokenPrivileges {
         SeEnableDelegationPrivilege  = 'Configure AD delegation (domain impact)'
     }
     try {
-        $raw = whoami.exe /priv /fo csv 2>$null | ConvertFrom-Csv
+        # /nh + positional headers: column names and State text are localized,
+        # privilege names (SeXxxPrivilege) are not.
+        $raw = whoami.exe /priv /fo csv /nh 2>$null | ConvertFrom-Csv -Header Privilege,Description,State
         foreach ($p in $raw) {
-            $name  = $p.'Privilege Name'
+            $name  = $p.Privilege
             $state = $p.State
             if ($hot.ContainsKey($name)) {
-                $sev = if ($state -match 'Enabled') { 'High' } else { 'Medium' }
-                Add-Finding -Category 'Token' -Title "$name held ($state)" -Severity $sev `
+                # A privilege present in the token can be enabled by the holder
+                # (AdjustTokenPrivileges), so "Disabled" is still exploitable.
+                Add-Finding -Category 'Token' -Title "$name held ($state)" -Severity High `
                     -Evidence ([pscustomobject]@{ Privilege = $name; State = $state }) `
                     -Remediation "Abuse path: $($hot[$name]). Remove from this account unless required."
             }
@@ -231,18 +297,41 @@ function Invoke-TokenPrivileges {
 #region ---------- Users, groups, admin membership ----------
 function Invoke-UserContext {
     Write-Section 'USERS & GROUPS'
+    # Integrity level from the token's mandatory-label SID (S-1-16-*), not localized text
+    $integrity = 'Unknown'
     try {
-        $wi = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-        $wp = New-Object System.Security.Principal.WindowsPrincipal($wi)
-        $isAdmin = $wp.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-        Add-Finding -Category 'User' -Title "Running as administrator: $isAdmin" `
-            -Severity $(if($isAdmin){'Info'}else{'Info'}) `
-            -Evidence ([pscustomobject]@{ Admin = $isAdmin; Integrity = 'see token' })
+        $labels = @{ 'S-1-16-0'='Untrusted'; 'S-1-16-4096'='Low'; 'S-1-16-8192'='Medium';
+                     'S-1-16-8448'='MediumPlus'; 'S-1-16-12288'='High'; 'S-1-16-16384'='System' }
+        $label = whoami.exe /groups /fo csv /nh 2>$null | ConvertFrom-Csv -Header Name,Type,Sid,Attributes |
+                 Where-Object { $_.Sid -like 'S-1-16-*' } | Select-Object -First 1
+        if ($label -and $labels.ContainsKey($label.Sid)) { $integrity = $labels[$label.Sid] }
     } catch {}
+    Add-Finding -Category 'User' -Title "Running elevated: $($script:IsElevated) (integrity: $integrity)" -Severity Info `
+        -Evidence ([pscustomobject]@{ Elevated = $script:IsElevated; Integrity = $integrity; User = $script:CurrentUser })
+    if ($script:IsElevated) {
+        Add-Finding -Category 'User' -Title 'Elevated run: Administrators/SYSTEM ACEs ignored in writability checks' -Severity Info `
+            -Evidence ([pscustomobject]@{ ExcludedSids = "$script:SidAdministrators, $script:SidSystem" }) `
+            -Remediation 'Writability findings reflect non-admin groups only. For the low-privilege view, run as the target low-privilege user.'
+    }
 
-    foreach ($grp in 'Administrators','Backup Operators','Remote Desktop Users','Remote Management Users','Hyper-V Administrators','DnsAdmins') {
+    # Built-in groups by SID (names are localized). DnsAdmins has no fixed SID; looked up by name.
+    $groups = @(
+        'S-1-5-32-544'   # Administrators
+        'S-1-5-32-551'   # Backup Operators
+        'S-1-5-32-555'   # Remote Desktop Users
+        'S-1-5-32-580'   # Remote Management Users
+        'S-1-5-32-578'   # Hyper-V Administrators
+        'DnsAdmins'
+    )
+    foreach ($key in $groups) {
         try {
-            $members = Get-LocalGroupMember -Name $grp -ErrorAction Stop
+            if ($key -like 'S-1-*') {
+                $members = Get-LocalGroupMember -SID $key -ErrorAction Stop
+                $grp = ConvertTo-AccountName $key
+            } else {
+                $members = Get-LocalGroupMember -Name $key -ErrorAction Stop
+                $grp = $key
+            }
             if ($members) {
                 Add-Finding -Category 'User' -Title "Local group '$grp' membership" -Severity Info `
                     -Evidence (@($members | Select-Object Name,PrincipalSource,ObjectClass))
@@ -306,16 +395,14 @@ function Invoke-ServiceChecks {
         $svcRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services'
         Get-ChildItem $svcRoot -ErrorAction SilentlyContinue | ForEach-Object {
             try {
-                $acl = Get-Acl $_.PSPath -ErrorAction Stop
-                foreach ($ace in $acl.Access) {
-                    if ($ace.AccessControlType -ne 'Allow') { continue }
-                    if ($script:Identities -notcontains $ace.IdentityReference.Value) { continue }
-                    if ($ace.RegistryRights -match 'FullControl|SetValue|WriteKey|TakeOwnership|ChangePermissions') {
-                        Add-Finding -Category 'Service' -Title "Writable service registry key: $($_.PSChildName)" -Severity High `
-                            -Evidence ([pscustomobject]@{ Key=$_.PSChildName; Identity=$ace.IdentityReference.Value; Rights=$ace.RegistryRights.ToString() }) `
-                            -Remediation 'Caller can rewrite ImagePath/ServiceDll -> SYSTEM. Tighten key ACL.'
-                        break
-                    }
+                $acl = Get-Acl -LiteralPath $_.PSPath -ErrorAction Stop
+                $r = Get-MyRights -Acl $acl -Kind Registry
+                if ($r.Mask -band $script:RegWriteMask) {
+                    $who = @($r.Grants | Where-Object { $_.Mask -band $script:RegWriteMask -band (-bnot $r.Deny) } |
+                             ForEach-Object Name | Sort-Object -Unique)
+                    Add-Finding -Category 'Service' -Title "Writable service registry key: $($_.PSChildName)" -Severity High `
+                        -Evidence ([pscustomobject]@{ Key=$_.PSChildName; Identity=($who -join ', '); Rights=([System.Security.AccessControl.RegistryRights]$r.Mask).ToString() }) `
+                        -Remediation 'Caller can rewrite ImagePath/ServiceDll or add a Performance subkey -> code as the service account. Tighten key ACL.'
                 }
             } catch {}
         }
@@ -326,20 +413,39 @@ function Invoke-ServiceChecks {
 #region ---------- Scheduled tasks ----------
 function Invoke-ScheduledTaskChecks {
     Write-Section 'SCHEDULED TASKS'
+    $privUser  = '(?i)^([^\\]+\\)?(SYSTEM|LocalSystem|LOCAL ?SERVICE|NETWORK ?SERVICE)$|^S-1-5-(18|19|20)$'
+    $adminLeaf = (ConvertTo-AccountName $script:SidAdministrators) -split '\\' | Select-Object -Last 1
+    # Script/binary paths passed as arguments (e.g. powershell -File C:\x\y.ps1)
+    $argPathRx = '(?i)"([A-Za-z]:\\[^"]+?\.(ps1|bat|cmd|vbs|js|exe|dll))"|([A-Za-z]:\\[^\s"]+?\.(ps1|bat|cmd|vbs|js|exe|dll))\b'
     try {
         Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.State -ne 'Disabled' } | ForEach-Object {
             $task = $_
+            $userId  = try { [string]$task.Principal.UserId }  catch { '' }
+            $groupId = try { [string]$task.Principal.GroupId } catch { '' }
+            $runLvl  = try { [string]$task.Principal.RunLevel } catch { '' }
+            $groupLeaf = ($groupId -split '\\') | Select-Object -Last 1
+            $elevatedRun = ($userId -match $privUser) -or ($runLvl -eq 'Highest') -or
+                           ($groupId -and ($groupLeaf -eq $adminLeaf -or $groupId -eq $script:SidAdministrators))
+            $sev = if ($elevatedRun) { 'High' } else { 'Medium' }
+            $runAs = if ($userId) { $userId } else { "Group: $groupId" }
+
             foreach ($act in @($task.Actions)) {
                 $exe = $act.Execute
                 if (-not $exe) { continue }
-                $resolved = [Environment]::ExpandEnvironmentVariables($exe).Trim('"')
-                $w = Test-WritableByMe $resolved
-                if ($w) {
-                    $principal = try { $task.Principal.UserId } catch { $null }
-                    $sev = if ($principal -match 'SYSTEM|Administrators') { 'High' } else { 'Medium' }
-                    Add-Finding -Category 'ScheduledTask' -Title "Writable task binary: $($task.TaskName)" -Severity $sev `
-                        -Evidence ([pscustomobject]@{ Task=$task.TaskName; Path=$task.TaskPath; Binary=$resolved; RunAs=$principal; Rights=$w.Rights }) `
-                        -Remediation 'Replaceable task image runs as the task principal. Fix ACLs on the binary/folder.'
+                $targets = [System.Collections.Generic.List[string]]::new()
+                $targets.Add([Environment]::ExpandEnvironmentVariables($exe).Trim('"'))
+                if ($act.Arguments) {
+                    foreach ($m in [regex]::Matches([Environment]::ExpandEnvironmentVariables($act.Arguments), $argPathRx)) {
+                        $targets.Add($(if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[3].Value }))
+                    }
+                }
+                foreach ($t in ($targets | Sort-Object -Unique)) {
+                    $w = Test-WritableByMe $t
+                    if ($w) {
+                        Add-Finding -Category 'ScheduledTask' -Title "Writable task target: $($task.TaskName)" -Severity $sev `
+                            -Evidence ([pscustomobject]@{ Task=$task.TaskName; Path=$task.TaskPath; Target=$t; RunAs=$runAs; RunLevel=$runLvl; Identity=$w.Identity; Rights=$w.Rights }) `
+                            -Remediation 'Replaceable task binary/script runs as the task principal. Fix ACLs on the file/folder.'
+                    }
                 }
             }
         }
@@ -362,8 +468,9 @@ function Invoke-AutorunChecks {
     foreach ($key in $runKeys) {
         if (-not (Test-Path $key)) { continue }
         $props = Get-ItemProperty $key -ErrorAction SilentlyContinue
+        $psMeta = 'PSPath','PSParentPath','PSChildName','PSDrive','PSProvider'
         foreach ($p in $props.PSObject.Properties) {
-            if ($p.Name -like 'PS*') { continue }
+            if ($psMeta -contains $p.Name) { continue }
             $bin = Get-BinaryPath ([Environment]::ExpandEnvironmentVariables([string]$p.Value))
             $w = Test-WritableByMe $bin
             if ($w) {
@@ -380,7 +487,10 @@ function Invoke-AutorunChecks {
 #region ---------- PATH & writable directories ----------
 function Invoke-PathChecks {
     Write-Section 'PATH DIRECTORIES'
-    $dirs = $env:PATH -split ';' | Where-Object { $_ } | Sort-Object -Unique
+    # Machine PATH only: it is what SYSTEM services resolve against. The user PATH
+    # (e.g. %LOCALAPPDATA%\Microsoft\WindowsApps) is writable by design and no privesc.
+    $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+    $dirs = $machinePath -split ';' | Where-Object { $_ } | Sort-Object -Unique
     foreach ($d in $dirs) {
         $expanded = [Environment]::ExpandEnvironmentVariables($d).Trim('"')
         if (-not (Test-Path -LiteralPath $expanded -ErrorAction SilentlyContinue)) { continue }
@@ -438,11 +548,13 @@ function Invoke-DefenderChecks {
         } else {
             Add-Finding -Category 'AV' -Title 'Defender status' -Severity Info -Evidence $ev
         }
-        # Attack-surface-reduction exclusions can hide payload drop locations
+        # Defender scan exclusions can hide payload drop locations.
+        # Non-admins may get a placeholder ("N/A: Must be an administrator...") instead of the list.
         $pref = Get-MpPreference -ErrorAction SilentlyContinue
-        if ($pref.ExclusionPath) {
+        $excl = @($pref.ExclusionPath | Where-Object { $_ -and $_ -notmatch '^N/A' })
+        if ($excl.Count -gt 0) {
             Add-Finding -Category 'AV' -Title 'Defender path exclusions present' -Severity Low `
-                -Evidence (@($pref.ExclusionPath)) `
+                -Evidence $excl `
                 -Remediation 'Excluded paths are common payload-staging locations; confirm they are justified.'
         }
     } catch {
@@ -479,10 +591,15 @@ function Invoke-CredentialChecks {
         "$env:windir\repair\system"
         "$env:windir\System32\config\RegBack\SYSTEM"
     ) | ForEach-Object {
-        if (Test-Path $_ -ErrorAction SilentlyContinue) {
-            try { Get-Content -LiteralPath $_ -TotalCount 1 -ErrorAction Stop | Out-Null
+        $item = Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue
+        # Since Win10 1803 RegBack holds 0-byte placeholders - not a finding.
+        if ($item -and $item.Length -gt 0) {
+            try {
+                $fs = [System.IO.File]::Open($item.FullName, 'Open', 'Read', 'ReadWrite')
+                $fs.Dispose()
                 Add-Finding -Category 'Credential' -Title "Readable registry hive backup: $_" -Severity High `
-                    -Evidence $_ -Remediation 'SAM+SYSTEM allow offline local-hash extraction. Restrict access.'
+                    -Evidence ([pscustomobject]@{ Path=$item.FullName; SizeBytes=$item.Length; LastWrite=$item.LastWriteTime }) `
+                    -Remediation 'SAM+SYSTEM allow offline local-hash extraction. Restrict access.'
             } catch {}
         }
     }
@@ -490,16 +607,19 @@ function Invoke-CredentialChecks {
     # Winlogon autologon credentials
     try {
         $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction Stop
-        if ($wl.DefaultPassword -or ($wl.AutoAdminLogon -eq '1' -and $wl.DefaultUserName)) {
-            Add-Finding -Category 'Credential' -Title 'Winlogon autologon credentials in registry' -Severity High `
-                -Evidence ([pscustomobject]@{ User=$wl.DefaultUserName; Domain=$wl.DefaultDomainName; PasswordPresent=[bool]$wl.DefaultPassword }) `
-                -Remediation 'DefaultPassword is stored in cleartext. Disable autologon or use LSA secrets.'
+        $ev = [pscustomobject]@{ User=$wl.DefaultUserName; Domain=$wl.DefaultDomainName; AutoAdminLogon=$wl.AutoAdminLogon; PasswordPresent=[bool]$wl.DefaultPassword }
+        if ($wl.DefaultPassword) {
+            Add-Finding -Category 'Credential' -Title 'Winlogon autologon cleartext password in registry' -Severity High `
+                -Evidence $ev -Remediation 'DefaultPassword is stored in cleartext. Disable autologon or store it as an LSA secret (Sysinternals Autologon).'
+        } elseif ($wl.AutoAdminLogon -eq '1' -and $wl.DefaultUserName) {
+            Add-Finding -Category 'Credential' -Title 'Autologon configured (no cleartext DefaultPassword)' -Severity Low `
+                -Evidence $ev -Remediation 'Password is likely held as an LSA secret (admin-retrievable). Confirm autologon is required.'
         }
     } catch {}
 
-    # Credential Manager entries
+    # Credential Manager entries ("Target:" label is localized; the ":target=" value format is not)
     try {
-        $cm = cmdkey.exe /list 2>$null | Select-String 'Target:'
+        $cm = cmdkey.exe /list 2>$null | Select-String -Pattern 'Target:|:target='
         if ($cm) {
             Add-Finding -Category 'Credential' -Title 'Credential Manager stored targets' -Severity Low `
                 -Evidence (@($cm | ForEach-Object { $_.ToString().Trim() })) `
@@ -511,7 +631,7 @@ function Invoke-CredentialChecks {
     $cloud = @('.aws\credentials','.azure\accessTokens.json','.azure\azureProfile.json',
                'AppData\Roaming\gcloud\credentials.db','AppData\Roaming\gcloud\legacy_credentials')
     try {
-        foreach ($u in (Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($u in (Get-ChildItem -LiteralPath $script:ProfilesDir -Directory -ErrorAction SilentlyContinue)) {
             foreach ($c in $cloud) {
                 $fp = Join-Path $u.FullName $c
                 if (Test-Path $fp -ErrorAction SilentlyContinue) {
@@ -572,14 +692,15 @@ function Invoke-CredentialChecks {
 # to keep false positives manageable on real server filesystems.
 $script:SecretPatterns = @(
     # --- Generic credential assignments (key = value / key: value) ---
-    [pscustomobject]@{ Name='Password assignment';      Severity='High';   Rx='(?i)(password|passwd|pwd)\s*[:=]\s*[''"]?[^\s''"]{3,}' }
+    # Also covers SQL/ODBC/OLEDB "Password=...;" / "Pwd=...;" fields. The lookbehind
+    # keeps GPP "cpassword" from double-firing here (it has its own pattern below).
+    [pscustomobject]@{ Name='Password assignment';      Severity='High';   Rx='(?i)(?<![a-z])(password|passwd|pwd)\s*[:=]\s*[''"]?[^\s''";]{3,}' }
     [pscustomobject]@{ Name='Secret assignment';        Severity='High';   Rx='(?i)(secret|client[_-]?secret|api[_-]?secret)\s*[:=]\s*[''"]?[^\s''"]{6,}' }
     [pscustomobject]@{ Name='API key assignment';       Severity='Medium'; Rx='(?i)(api[_-]?key|apikey|access[_-]?key|x-api-key)\s*[:=]\s*[''"]?[A-Za-z0-9/\-_+]{8,}' }
     [pscustomobject]@{ Name='Token assignment';         Severity='Medium'; Rx='(?i)(auth[_-]?token|access[_-]?token|bearer|refresh[_-]?token)\s*[:=]\s*[''"]?[A-Za-z0-9\.\-_]{8,}' }
     [pscustomobject]@{ Name='Username assignment';      Severity='Low';    Rx='(?i)(username|user|login|uid)\s*[:=]\s*[''"]?[^\s''"]{2,}' }
 
     # --- Connection strings ---
-    [pscustomobject]@{ Name='DB connection string pwd'; Severity='High';   Rx='(?i)(password|pwd)\s*=\s*[^;''"\s]{3,}\s*;?' }
     [pscustomobject]@{ Name='ODBC/OLEDB connstr';       Severity='Medium'; Rx='(?i)(Data Source|Server|Initial Catalog|Database)\s*=\s*[^;]+;(.*?)(User Id|Uid)\s*=' }
     [pscustomobject]@{ Name='MongoDB/Redis URI';        Severity='High';   Rx='(?i)(mongodb(\+srv)?|redis|amqp|postgres(ql)?|mysql)://[^:\s]+:[^@\s]+@' }
 
@@ -609,6 +730,27 @@ $script:SecretPatterns = @(
     [pscustomobject]@{ Name='ConvertTo-SecureString';   Severity='Medium'; Rx='(?i)ConvertTo-SecureString\s+.*-AsPlainText' }
 )
 
+# Mask a matched secret so the report doesn't become a secret store itself.
+# key=value / key: value -> keep the key and at most 2 chars of the value.
+# Bare tokens (AKIA..., ghp_..., eyJ...) -> keep at most the first 4 chars.
+# Masked length is fixed so it doesn't reveal the secret's length.
+function Get-MaskedSample {
+    param([string]$Text)
+    $Text = $Text.Trim()
+    if ($Text.Length -gt 80) { $Text = $Text.Substring(0, 80) }
+    $sep = $Text.IndexOfAny([char[]]@(':', '='))
+    if ($sep -ge 0) {
+        $head = $Text.Substring(0, $sep + 1)
+        $val  = $Text.Substring($sep + 1)
+        $lead = [regex]::Match($val, '^[\s''"]*').Value
+        $val  = $val.Substring($lead.Length)
+        $show = [Math]::Min(2, [int][Math]::Floor($val.Length / 4))
+        return $head + $lead + $val.Substring(0, $show) + '********'
+    }
+    $show = [Math]::Min(4, [int][Math]::Floor($Text.Length / 4))
+    return $Text.Substring(0, $show) + '********'
+}
+
 function Invoke-SecretScan {
     if (-not $SecretScan) { return }
     Write-Section 'SECRET / CREDENTIAL FILE SCAN'
@@ -620,8 +762,8 @@ function Invoke-SecretScan {
             "$env:ProgramData"
             "$env:windir\System32\inetsrv\config"
             "$env:USERPROFILE"
-            "C:\Users\Public"
-        ) | Where-Object { Test-Path $_ -ErrorAction SilentlyContinue } | Sort-Object -Unique
+            "$env:PUBLIC"
+        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -ErrorAction SilentlyContinue) } | Sort-Object -Unique
         # In Deep depth, widen to all fixed-drive roots.
         if ($Depth -eq 'Deep') {
             $ScanRoots = (Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
@@ -656,14 +798,7 @@ function Invoke-SecretScan {
                     $m = [regex]::Matches($content, $pat.Rx)
                     if ($m.Count -gt 0) {
                         $matched++
-                        # Redact the matched value so the report doesn't become a secret store itself.
-                        $samples = $m | Select-Object -First 3 | ForEach-Object {
-                            $v = $_.Value
-                            if ($v.Length -gt 60) { $v = $v.Substring(0,60) + '...' }
-                            # mask the back half of the match
-                            $cut = [int]($v.Length/2)
-                            $v.Substring(0,$cut) + ('*' * ($v.Length - $cut))
-                        }
+                        $samples = $m | Select-Object -First 3 | ForEach-Object { Get-MaskedSample $_.Value }
                         Add-Finding -Category 'SecretScan' -Title "$($pat.Name) in $([System.IO.Path]::GetFileName($file))" `
                             -Severity $pat.Severity `
                             -Evidence ([pscustomobject]@{
@@ -709,8 +844,8 @@ function Invoke-NetworkChecks {
 #region ---------- Reporting ----------
 function Export-Report {
     $min = $script:SevRank[$MinSeverity]
-    $results = $script:Findings | Where-Object { $_.SevRank -ge $min } |
-               Sort-Object SevRank -Descending
+    $results = @($script:Findings | Where-Object { $_.SevRank -ge $min } |
+                 Sort-Object SevRank -Descending)
 
     if ($Format -contains 'Console') {
         Write-Host ""
@@ -728,11 +863,18 @@ function Export-Report {
         Write-Host ("Completed in {0:N1}s. {1} findings total." -f $script:Stopwatch.Elapsed.TotalSeconds, $script:Findings.Count) -ForegroundColor Cyan
     }
 
+    $fileFormats = @($Format | Where-Object { $_ -ne 'Console' })
+    if ($fileFormats.Count -gt 0 -and -not (Test-Path -LiteralPath $OutputPath)) {
+        try { New-Item -ItemType Directory -Path $OutputPath -Force -ErrorAction Stop | Out-Null }
+        catch { Write-Warning "Cannot create output folder '$OutputPath': $($_.Exception.Message)"; return }
+    }
+
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $base  = Join-Path $OutputPath ("PrivEscAudit_{0}_{1}" -f $env:COMPUTERNAME,$stamp)
 
     if ($Format -contains 'Json') {
-        $results | ConvertTo-Json -Depth 6 | Out-File "$base.json" -Encoding utf8
+        # -InputObject keeps a JSON array even with 0 or 1 findings (PS 5.1 unrolls otherwise)
+        ConvertTo-Json -InputObject $results -Depth 6 | Out-File "$base.json" -Encoding utf8
         Write-Verbose "JSON -> $base.json"
     }
     if ($Format -contains 'Csv') {
@@ -752,22 +894,26 @@ function Export-HtmlReport {
     param($Results, [string]$Path)
     $sevBg = @{ Critical='#7f1d1d'; High='#b91c1c'; Medium='#b45309'; Low='#4d7c0f'; Info='#334155' }
     $counts = $script:Findings | Group-Object Severity | ForEach-Object { "$($_.Name): $($_.Count)" }
+    # System.Net.WebUtility ships with both Windows PowerShell 5.1 and PowerShell 7
+    # (System.Web.HttpUtility is not loaded by default on 5.1).
+    $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
     $rows = foreach ($f in $Results) {
-        $ev = [System.Web.HttpUtility]::HtmlEncode((($f.Evidence | ConvertTo-Json -Depth 4)))
+        $ev = & $enc (ConvertTo-Json -InputObject $f.Evidence -Depth 4)
         $bg = $sevBg[$f.Severity]
         @"
 <tr>
   <td><span class="sev" style="background:$bg">$($f.Severity)</span></td>
-  <td>$([System.Web.HttpUtility]::HtmlEncode($f.Category))</td>
-  <td>$([System.Web.HttpUtility]::HtmlEncode($f.Title))</td>
-  <td>$([System.Web.HttpUtility]::HtmlEncode($f.Remediation))</td>
+  <td>$(& $enc $f.Category)</td>
+  <td>$(& $enc $f.Title)</td>
+  <td>$(& $enc $f.Remediation)</td>
   <td><pre>$ev</pre></td>
 </tr>
 "@
     }
-    Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
+    $hostName = & $enc $env:COMPUTERNAME
+    $userName = & $enc $script:CurrentUser
     $html = @"
-<!DOCTYPE html><html><head><meta charset="utf-8"><title>PrivEsc Audit - $env:COMPUTERNAME</title>
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>PrivEsc Audit - $hostName</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px}
 h1{font-size:20px} .meta{color:#94a3b8;font-size:13px;margin-bottom:16px}
@@ -779,7 +925,7 @@ pre{margin:0;white-space:pre-wrap;color:#cbd5e1;font-size:12px;max-width:420px;o
 tr:nth-child(even){background:#111c33}
 </style></head><body>
 <h1>Local Privilege-Escalation Audit</h1>
-<div class="meta">Host: $env:COMPUTERNAME &nbsp;|&nbsp; User: $script:CurrentUser &nbsp;|&nbsp;
+<div class="meta">Host: $hostName &nbsp;|&nbsp; User: $userName &nbsp;|&nbsp;
 Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') &nbsp;|&nbsp; Depth: $Depth<br>
 Counts &nbsp; $([string]::Join(' &nbsp; ', $counts))</div>
 <table><thead><tr><th>Severity</th><th>Category</th><th>Finding</th><th>Remediation</th><th>Evidence</th></tr></thead>

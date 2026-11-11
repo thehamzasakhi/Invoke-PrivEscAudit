@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse
+        shell: pwsh
+        run: |
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path ./Invoke-PrivEscAudit.ps1), [ref]$null, [ref]$errs) | Out-Null
+          if ($errs) { $errs | ForEach-Object { Write-Host "::error::$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+
+      - name: PSScriptAnalyzer (errors)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path ./Invoke-PrivEscAudit.ps1 -Severity Error
+          $r | Format-Table -AutoSize | Out-String | Write-Host
+          if ($r) { exit 1 }
+
+  run:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]   # Windows PowerShell 5.1 and PowerShell 7
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run audit and validate reports (${{ matrix.shell }})
+        shell: ${{ matrix.shell }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'report'
+          $Error.Clear()
+          ./Invoke-PrivEscAudit.ps1 -Depth Standard -SecretScan -ScanRoots $PWD -Format Console,Json,Csv,Html -OutputPath $out
+
+          $typeErrors = @($Error | Where-Object { "$_" -match 'Unable to find type' })
+          if ($typeErrors) { $typeErrors | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+
+          $json = Get-ChildItem $out -Filter *.json | Select-Object -First 1
+          $html = Get-ChildItem $out -Filter *.html | Select-Object -First 1
+          $csv  = Get-ChildItem $out -Filter *.csv  | Select-Object -First 1
+          if (-not ($json -and $html -and $csv)) { Write-Host '::error::Missing report file(s)'; exit 1 }
+
+          $findings = Get-Content $json.FullName -Raw | ConvertFrom-Json
+          $rows = ([regex]::Matches((Get-Content $html.FullName -Raw), '<tr>')).Count - 1   # minus header row
+          Write-Host "JSON findings: $(@($findings).Count)  HTML rows: $rows"
+          if (@($findings).Count -lt 1) { Write-Host '::error::JSON report has no findings'; exit 1 }
+          if ($rows -ne @($findings).Count) { Write-Host "::error::HTML rows ($rows) != JSON findings ($(@($findings).Count))"; exit 1 }
