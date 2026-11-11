@@ -28,6 +28,52 @@ A read-only Windows **privilege-escalation** and **credential-exposure** enumera
 
 ---
 
+## Running the script (execution policy)
+
+Windows blocks `.ps1` scripts by default (`Restricted` on clients, `RemoteSigned` on servers). Use any of these. None of them permanently changes the machine's policy.
+
+**Option 1: one-off launch (recommended)**
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\Invoke-PrivEscAudit.ps1
+
+# with parameters
+powershell.exe -ExecutionPolicy Bypass -File .\Invoke-PrivEscAudit.ps1 -Depth Standard -SecretScan -Format Console,Json,Html
+```
+
+**Option 2: current session only**
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\Invoke-PrivEscAudit.ps1
+```
+
+This setting ends when the window closes and does not need admin rights.
+
+**Option 3: downloaded file**
+
+Files downloaded from the internet carry a Mark-of-the-Web flag that `RemoteSigned` blocks. Clear it:
+
+```powershell
+Unblock-File .\Invoke-PrivEscAudit.ps1
+```
+
+**Option 4: in-memory**
+
+```powershell
+Get-Content .\Invoke-PrivEscAudit.ps1 -Raw | Invoke-Expression
+```
+
+This runs with default parameters only (Quick depth, Console + HTML).
+
+### When it still won't run
+
+- **AppLocker / WDAC**: application control policies can block the script regardless of execution policy.
+- **Constrained Language Mode**: check with `$ExecutionContext.SessionState.LanguageMode`. If it isn't `FullLanguage`, parts of the script will fail because it uses .NET types directly.
+- **Defender / AMSI**: the secret-scan patterns and privilege names may trigger detection. On an authorized engagement, agree an exclusion with the client rather than attempting to evade it.
+
+---
+
 ## Usage
 
 ```powershell
